@@ -32,6 +32,7 @@ ai_workers/venv_new/
 __pycache__/
 *.pyc
 *.pyo
+*.session
 
 # Database
 database/*.sqlite
