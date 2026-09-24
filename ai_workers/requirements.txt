@@ -1,0 +1,7 @@
+telethon
+ccxt
+requests
+sqlalchemy
+google-generativeai
+python-dotenv
+feedparser

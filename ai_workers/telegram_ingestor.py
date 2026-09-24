@@ -1,0 +1,196 @@
+import os
+import time
+from telethon import TelegramClient, events
+from sqlalchemy import create_engine, Column, Integer, String, Text, ForeignKey, Float
+from sqlalchemy.orm import sessionmaker, declarative_base
+from dotenv import load_dotenv
+import asyncio
+from datetime import datetime, timedelta, timezone
+
+import re
+load_dotenv("../.env")
+
+def is_signal_worthy(text, channel_name=""):
+    if not text: return False
+    # ROI-TEST 2026-09-20: whitelisted proven channels use OR logic (any cue passes);
+    # others keep strict AND template to filter chatter.
+    whitelist = ["mudrex", "whales crypto guide"]
+    ch = (channel_name or "").lower()
+    is_whitelisted = any(w in ch for w in whitelist)
+    text = text.lower()
+    
+    # 1. Must contain an action/direction
+    has_action = any(x in text for x in ['buy', 'sell', 'long', 'short'])
+    
+    # 2. Must mention an entry (either the word 'entry' or an '@' symbol for price)
+    has_entry = any(x in text for x in ['entry', 'buy zone', '@'])
+    
+    # 3. Must mention a target or stop loss
+    has_targets = any(x in text for x in ['tp', 'target', 'sl', 'stop'])
+    
+    if is_whitelisted:
+        if has_action or has_entry or has_targets:
+            return True
+        return False
+    # Only forward to the Local LLM if ALL criteria are met (Strict Template)
+    if has_action and has_entry and has_targets:
+        return True
+        
+    return False
+
+# --- CONFIGURATION ---
+API_ID = int(os.getenv('TELEGRAM_API_ID')) if os.getenv('TELEGRAM_API_ID') else None
+API_HASH = os.getenv('TELEGRAM_API_HASH')
+
+# --- DATABASE SETUP ---
+Base = declarative_base()
+
+class Setting(Base):
+    __tablename__ = 'settings'
+    id = Column(Integer, primary_key=True)
+    key = Column(String, unique=True)
+    value = Column(String)
+
+class Source(Base):
+    __tablename__ = 'sources'
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    type = Column(String)
+    status = Column(String)
+    catch_up_hours = Column(Integer, default=0)
+
+class NewsItem(Base):
+    __tablename__ = 'news_items'
+    id = Column(Integer, primary_key=True)
+    source_id = Column(Integer, ForeignKey('sources.id'))
+    raw_text = Column(Text)
+    status = Column(String, default='pending')
+    created_at = Column(String)
+
+# SQLAlchemy setup
+db_path = "../database/database.sqlite"
+engine = create_engine(f"sqlite:///{db_path}", connect_args={'timeout': 30})
+Session = sessionmaker(bind=engine)
+
+def log_to_file(message):
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        print(f"[{timestamp}] {message}", flush=True)
+    except:
+        pass # Ignore console print errors for special chars
+    
+    with open("telegram.log", "a", encoding='utf-8') as f:
+        f.write(f"[{timestamp}] {message}\n")
+        f.flush()
+
+# --- TELEGRAM CLIENT ---
+client = TelegramClient('anon', API_ID, API_HASH)
+
+@client.on(events.NewMessage())
+async def my_event_handler(event):
+    if not event.raw_text:
+        return
+        
+    session = Session()
+    try:
+        chat = await event.get_chat()
+        channel_name = getattr(chat, 'title', None) or getattr(chat, 'username', None)
+        if not channel_name:
+            return
+            
+        # Dynamically query if this is an active telegram source
+        source = session.query(Source).filter(
+            Source.name == channel_name,
+            Source.type == 'telegram',
+            Source.status == 'active'
+        ).first()
+        
+        # Fallback check against username
+        if not source and getattr(chat, 'username', None):
+            source = session.query(Source).filter(
+                Source.name == chat.username,
+                Source.type == 'telegram',
+                Source.status == 'active'
+            ).first()
+            
+        if not source:
+            return
+
+        if not is_signal_worthy(event.raw_text, channel_name):
+            log_to_file(f"Ignored non-signal from {channel_name}")
+            return
+
+        log_to_file(f"New Telegram signal from {channel_name}")
+        new_item = NewsItem(
+            source_id=source.id,
+            raw_text=event.raw_text,
+            status='pending',
+            created_at=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        )
+        session.add(new_item)
+        session.commit()
+    except Exception as e:
+        log_to_file(f"Telegram processing error: {e}")
+        session.rollback()
+    finally:
+        session.close()
+
+async def heartbeat_loop():
+    while True:
+        session = Session()
+        try:
+            # Update Heartbeat
+            heartbeat_setting = session.query(Setting).filter(Setting.key == 'last_heartbeat_ingestor').first()
+            if heartbeat_setting:
+                heartbeat_setting.value = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+                session.commit()
+        except Exception as e:
+            log_to_file(f"Heartbeat Error: {e}")
+        finally:
+            session.close()
+            await asyncio.sleep(60)
+
+async def startup_sweep():
+    session = Session()
+    try:
+        sources = session.query(Source).filter(Source.type == 'telegram', Source.status == 'active').all()
+        for source in sources:
+            try:
+                if source.catch_up_hours > 0:
+                    log_to_file(f"Sweeping history for {source.name} (last {source.catch_up_hours}h)...")
+                    offset_date = datetime.now(timezone.utc) - timedelta(hours=source.catch_up_hours)
+                    
+                    async for message in client.iter_messages(source.name, offset_date=offset_date, reverse=True):
+                        exists = session.query(NewsItem).filter(NewsItem.raw_text == message.text, NewsItem.source_id == source.id).first()
+                        if not exists and message.text and is_signal_worthy(message.text, source.name):
+                            new_item = NewsItem(
+                                source_id=source.id,
+                                raw_text=message.text,
+                                status='pending',
+                                created_at=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+                            )
+                            session.add(new_item)
+                            log_to_file(f"Recovered old signal from {source.name}: {message.text[:30]}...")
+                    session.commit()
+            except Exception as e:
+                log_to_file(f"Skipping history sweep for {source.name} due to entity resolution issue: {e}")
+    except Exception as e:
+        log_to_file(f"Startup sweep error: {e}")
+    finally:
+        session.close()
+
+if __name__ == "__main__":
+    if not API_ID or not API_HASH:
+        log_to_file("ERROR: TELEGRAM_API_ID or TELEGRAM_API_HASH not set in .env")
+    else:
+        log_to_file("Telegram Ingestor Started. Listening for signals...")
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.create_task(heartbeat_loop())
+        
+        async def main():
+            await client.start()
+            await startup_sweep()
+            await client.run_until_disconnected()
+            
+        loop.run_until_complete(main())

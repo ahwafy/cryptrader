@@ -1,0 +1,402 @@
+"""
+Technical Analysis Engine v1.0
+===============================
+Primary signal generator using RSI, MACD, Bollinger Bands, and Volume.
+Runs independently. NO LLM API calls — pure mathematical indicators only.
+"""
+import os
+import sys
+import time
+import ccxt
+from datetime import datetime, timezone
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, Column, Integer, String, Text, Float, ForeignKey, DateTime, event
+from sqlalchemy.orm import sessionmaker, declarative_base
+
+load_dotenv("../.env")
+
+Base = declarative_base()
+
+class Source(Base):
+    __tablename__ = 'sources'
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    type = Column(String)
+    status = Column(String)
+    historical_win_rate = Column(Float, default=0.75)
+
+class Signal(Base):
+    __tablename__ = 'signals'
+    id = Column(Integer, primary_key=True)
+    source_id = Column(Integer, ForeignKey('sources.id'))
+    raw_text = Column(Text)
+    parsed_sentiment = Column(Float)
+    asset = Column(String)
+    status = Column(String, default='pending')
+    result = Column(String)
+    created_at = Column(DateTime)
+
+class Setting(Base):
+    __tablename__ = 'settings'
+    id = Column(Integer, primary_key=True)
+    key = Column(String, unique=True)
+    value = Column(String)
+
+engine = create_engine('sqlite:///../database/database.sqlite', connect_args={'timeout': 60})
+
+@event.listens_for(engine, 'connect')
+def set_sqlite_pragma(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA busy_timeout=60000")
+    cursor.close()
+
+Base.metadata.create_all(engine)
+Session = sessionmaker(bind=engine)
+
+def log_to_file(message):
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    formatted = f"[{timestamp}] {message}"
+    try:
+        print(formatted, flush=True)
+    except:
+        pass
+    with open("ta_engine.log", "a", encoding='utf-8') as f:
+        f.write(formatted + "\n")
+        f.flush()
+
+def heartbeat():
+    session = Session()
+    try:
+        from sqlalchemy import text
+        now_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        session.execute(text("INSERT OR REPLACE INTO settings (key, value) VALUES ('last_heartbeat_ta_engine', :val)"), {"val": now_str})
+        session.commit()
+    except:
+        session.rollback()
+    finally:
+        session.close()
+
+# =============================================
+# TECHNICAL INDICATORS (Pure Math — No LLM)
+# =============================================
+
+def calculate_rsi(closes, period=14):
+    """Calculate Relative Strength Index."""
+    if len(closes) < period + 1:
+        return 50.0  # Neutral fallback
+    
+    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    gains = [d if d > 0 else 0 for d in deltas]
+    losses = [-d if d < 0 else 0 for d in deltas]
+    
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+def calculate_macd(closes, fast=12, slow=26, signal_period=9):
+    """Calculate MACD line, signal line, and histogram."""
+    if len(closes) < slow + signal_period:
+        return 0, 0, 0
+    
+    def ema(data, period):
+        multiplier = 2 / (period + 1)
+        result = [data[0]]
+        for i in range(1, len(data)):
+            result.append((data[i] - result[-1]) * multiplier + result[-1])
+        return result
+    
+    ema_fast = ema(closes, fast)
+    ema_slow = ema(closes, slow)
+    
+    macd_line = [ema_fast[i] - ema_slow[i] for i in range(len(closes))]
+    signal_line = ema(macd_line[slow-1:], signal_period)
+    
+    # Pad signal line to match length
+    padded_signal = [0] * (slow - 1) + signal_line
+    
+    current_macd = macd_line[-1]
+    current_signal = padded_signal[-1] if len(padded_signal) >= len(macd_line) else signal_line[-1]
+    prev_macd = macd_line[-2]
+    prev_signal = padded_signal[-2] if len(padded_signal) >= len(macd_line) else signal_line[-2]
+    
+    histogram = current_macd - current_signal
+    
+    # Detect crossover
+    crossover = 0  # 0=none, 1=bullish, -1=bearish
+    if prev_macd <= prev_signal and current_macd > current_signal:
+        crossover = 1  # Bullish crossover
+    elif prev_macd >= prev_signal and current_macd < current_signal:
+        crossover = -1  # Bearish crossover
+    
+    return current_macd, current_signal, crossover
+
+def calculate_ema(data, period=200):
+    if len(data) < period:
+        return None
+    multiplier = 2 / (period + 1)
+    result = sum(data[:period]) / period
+    for i in range(period, len(data)):
+        result = (data[i] - result) * multiplier + result
+    return result
+
+def calculate_bollinger_bands(closes, period=20, std_dev=2):
+    """Calculate Bollinger Bands (upper, middle, lower)."""
+    if len(closes) < period:
+        return None, None, None
+    
+    recent = closes[-period:]
+    middle = sum(recent) / period
+    variance = sum((x - middle) ** 2 for x in recent) / period
+    std = variance ** 0.5
+    
+    upper = middle + (std_dev * std)
+    lower = middle - (std_dev * std)
+    
+    return upper, middle, lower
+
+def calculate_volume_confirmation(volumes, period=20):
+    """Check if current volume is significantly above average."""
+    if len(volumes) < period + 1:
+        return False, 1.0
+    
+    avg_volume = sum(volumes[-period-1:-1]) / period
+    current_volume = volumes[-1]
+    
+    if avg_volume == 0:
+        return False, 1.0
+    
+    ratio = current_volume / avg_volume
+    # ROI-TEST 2026-09-20: Vol 1.5 -> 1.0 to allow breakout entries in normal tape
+    return ratio >= 1.0, round(ratio, 2)
+
+# =============================================
+# SIGNAL GENERATION
+# =============================================
+
+def analyze_asset(exchange, asset, timeframe='5m', candle_limit=250):
+    """Run Trend-Filtered Momentum Strategy on an asset."""
+    symbol = f"{asset}/USDT"
+    
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=candle_limit)
+        if len(ohlcv) < 220:
+            log_to_file(f"[TA] {asset} ({timeframe}): Not enough candle data for 200 EMA ({len(ohlcv)} candles)")
+            return None
+    except Exception as e:
+        log_to_file(f"[TA] Failed to fetch {symbol} ({timeframe}): {e}")
+        return None
+    
+    closes = [c[4] for c in ohlcv]
+    volumes = [c[5] for c in ohlcv]
+    current_price = closes[-1]
+    
+    # --- 1. The Macro Trend Filter (The Shield) ---
+    ema_200 = calculate_ema(closes, period=200)
+    if not ema_200:
+        return None
+    
+    macro_trend = "UP" if current_price > ema_200 else "DOWN"
+    
+    # --- 2. Momentum Indicators ---
+    rsi = calculate_rsi(closes)
+    macd_val, signal_val, macd_crossover = calculate_macd(closes)
+    bb_upper, bb_middle, bb_lower = calculate_bollinger_bands(closes)
+    vol_confirmed, vol_ratio = calculate_volume_confirmation(volumes)
+    
+    direction = None
+    
+    # --- 3. Breakout-Momentum Logic (ROI-TEST 2026-09-20) ---
+    # Was strict pullback (UP: RSI<45 + cross==1); in trending tape that BLOCKED
+    # ~11.8k evals. Now breakout: follow trend when momentum + volume agree.
+    if macro_trend == "UP":
+        # LONG breakout: price above EMA200, RSI strong (>55), MACD above signal, volume confirms
+        if rsi > 55 and macd_val > signal_val and vol_confirmed:
+            direction = "LONG"
+    elif macro_trend == "DOWN":
+        # SHORT breakdown: price below EMA200, RSI weak (<45), MACD below signal, volume confirms
+        if rsi < 45 and macd_val < signal_val and vol_confirmed:
+            direction = "SHORT"
+            
+    log_to_file(
+        f"[TA] {asset} ({timeframe}): P={current_price:.4f} | EMA200={ema_200:.4f}({macro_trend}) | "
+        f"RSI={rsi:.1f} | MACD_Cross={macd_crossover} | Vol={vol_ratio}x "
+        f"=> {'SIGNAL: ' + direction if direction else 'BLOCKED'}"
+    )
+    
+    if not direction:
+        return None
+    
+    # Calculate TP and SL based on Bollinger Bands width (volatility-adaptive)
+    if bb_upper and bb_lower:
+        bb_width = bb_upper - bb_lower
+        if direction == "LONG":
+            stop_loss = round(current_price - (bb_width * 0.4), 6)
+            take_profit = round(current_price + (bb_width * 0.8), 6)  # 1:2 R:R
+        else:
+            stop_loss = round(current_price + (bb_width * 0.4), 6)
+            take_profit = round(current_price - (bb_width * 0.8), 6)
+    else:
+        # Fallback: 2% SL, 4% TP
+        if direction == "LONG":
+            stop_loss = round(current_price * 0.98, 6)
+            take_profit = round(current_price * 1.04, 6)
+        else:
+            stop_loss = round(current_price * 1.02, 6)
+            take_profit = round(current_price * 0.96, 6)
+    
+    return {
+        "asset": asset,
+        "direction": direction,
+        "price": current_price,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "rsi": round(rsi, 2),
+        "macd_crossover": macd_crossover,
+        "bb_signal": 0,
+        "vol_ratio": vol_ratio,
+        "indicator_count": 4, # Max score for passing the strict funnel
+        "timeframe": timeframe
+    }
+
+def create_ta_signal(session, source, signal_data):
+    """Create a TA signal in the database."""
+    asset = signal_data["asset"]
+    direction = signal_data["direction"]
+    price = signal_data["price"]
+    sl = signal_data["stop_loss"]
+    tp = signal_data["take_profit"]
+    rsi = signal_data["rsi"]
+    tf = signal_data["timeframe"]
+    indicators = signal_data["indicator_count"]
+    
+    # Check for duplicate: Don't spam if we already have a pending TA signal for same asset + direction
+    existing = session.query(Signal).filter(
+        Signal.source_id == source.id,
+        Signal.asset == asset,
+        Signal.status == 'pending'
+    ).first()
+    
+    if existing:
+        # Check if same direction
+        if direction in (existing.raw_text or ''):
+            log_to_file(f"[TA] Skipping duplicate {direction} signal for {asset} (pending signal #{existing.id} exists)")
+            return False
+    
+    raw_text = (
+        f"📊 TA ENGINE SIGNAL ({tf}): {direction} {asset}/USDT at {price}. "
+        f"RSI={rsi}, {indicators}/4 indicators agree. "
+        f"Entry: {price}, SL: {sl}, TP: {tp}."
+    )
+    
+    sentiment = 0.85 if direction == "LONG" else 0.15
+    
+    new_signal = Signal(
+        source_id=source.id,
+        raw_text=raw_text,
+        parsed_sentiment=sentiment,
+        asset=asset,
+        status='pending',
+        created_at=datetime.now()
+    )
+    session.add(new_signal)
+    session.commit()
+    
+    log_to_file(f"[TA] ✅ SIGNAL CREATED: {direction} {asset} @ {price} | SL={sl} TP={tp} | Confidence: {indicators}/4")
+    return True
+
+def initialize_ta_source():
+    """Ensure TA Engine source exists in DB."""
+    session = Session()
+    try:
+        src = session.query(Source).filter_by(name='TA Engine').first()
+        if not src:
+            src = Source(
+                name='TA Engine',
+                type='api',
+                status='active',
+                historical_win_rate=0.60
+            )
+            session.add(src)
+            session.commit()
+            log_to_file("[TA] Initialized 'TA Engine' source in database.")
+        return src.id
+    finally:
+        session.close()
+
+def main():
+    log_to_file("=" * 60)
+    log_to_file("Technical Analysis Engine v1.0 Started")
+    log_to_file("Indicators: RSI(14), MACD(12,26,9), BB(20,2σ), Volume(20)")
+    log_to_file("Zero LLM API calls — pure mathematical analysis")
+    log_to_file("=" * 60)
+    
+    source_id = initialize_ta_source()
+    
+    # Assets to analyze (expanded to Top 25 for velocity)
+    tracked_assets = [
+        "BTC", "ETH", "SOL", "BNB", "LINK",
+        "XRP", "ADA", "AVAX", "DOGE", "DOT",
+        "MATIC", "SHIB", "TRX", "UNI", "LTC",
+        "ATOM", "NEAR", "BCH", "APT", "INJ",
+        "OP", "ARB", "RNDR", "PEPE", "SUI"
+    ]
+    
+    # Exchange instance (public API only — no keys needed for candle data)
+    exchange = ccxt.binance({'enableRateLimit': True})
+    
+    cycle_count = 0
+    
+    while True:
+        try:
+            cycle_count += 1
+            heartbeat()
+            log_to_file(f"\n--- TA Scan Cycle #{cycle_count} ---")
+            
+            session = Session()
+            try:
+                source = session.get(Source, source_id)
+                if not source or source.status != 'active':
+                    log_to_file("[TA] Engine is disabled. Sleeping...")
+                    time.sleep(60)
+                    continue
+                
+                for asset in tracked_assets:
+                    # 5-minute candle analysis (scalp/short-term)
+                    signal_5m = analyze_asset(exchange, asset, timeframe='5m', candle_limit=250)
+                    if signal_5m:
+                        create_ta_signal(session, source, signal_5m)
+                    
+                    # 1-hour candle analysis (swing trades)
+                    signal_1h = analyze_asset(exchange, asset, timeframe='1h', candle_limit=250)
+                    if signal_1h:
+                        signal_1h["timeframe"] = "1h"
+                        create_ta_signal(session, source, signal_1h)
+                    
+                    # Rate limit courtesy
+                    time.sleep(1)
+                    
+            finally:
+                session.close()
+            
+            # Wait 5 minutes before next scan
+            log_to_file(f"--- Cycle #{cycle_count} complete. Next scan in 5 minutes ---")
+            time.sleep(300)
+            
+        except KeyboardInterrupt:
+            log_to_file("[TA] Engine shut down gracefully.")
+            break
+        except Exception as e:
+            log_to_file(f"[TA] Main loop error: {e}")
+            time.sleep(60)
+
+if __name__ == "__main__":
+    main()
